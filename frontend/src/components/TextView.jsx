@@ -5,27 +5,81 @@ import { createTextIndex } from '../textIndex'
  * 把文本按所有编码边界切成原子段，每段携带覆盖它的编码列表。
  * 区间一律为 Unicode 码位坐标（与 API / 数据库一致）；切原文时经索引
  * 转成 UTF-16 偏移，绝不会把补充平面字符（如 emoji）的代理对切开。
+ *
+ * 扫线实现：每条标注（先裁剪到 [0, n]，零长 / 越界标注不产生事件）拆成
+ * start 处的“开始”与 end 处的“结束”两个事件，按码位位置排序后只扫一遍，
+ * 维护当前活动标注集合；同一点先处理结束再处理开始，正好对应半开区间
+ * [start, end) 的相邻不重叠。活动下标始终按 codings 数组下标升序维护，
+ * 故每段 codings 的顺序与旧实现 codings.filter 全量扫描的结果一致；
+ * 复杂度 O(E log E + 输出规模)（E = 标注数 × 2），支撑单篇数千条重叠标注。
+ * 不产出空片段（end <= start 直接跳过），空片段自始不会被渲染。
  */
 export function buildSegments(content, codings) {
   const idx = createTextIndex(content)
-  const points = new Set([0, idx.length])
-  for (const c of codings) {
-    points.add(Math.max(0, c.start))
-    points.add(Math.min(idx.length, c.end))
+  const n = idx.length
+  // [位置, 类型(0=结束先处理, 1=开始后处理), 标注在 codings 中的下标]
+  const events = []
+  for (let i = 0; i < codings.length; i++) {
+    const c = codings[i]
+    const s = Math.max(0, c.start)
+    const e = Math.min(n, c.end)
+    if (s < e) {
+      events.push([s, 1, i])
+      events.push([e, 0, i])
+    }
   }
-  const sorted = [...points].sort((a, b) => a - b)
+  events.sort((a, b) => a[0] - b[0] || a[1] - b[1])
+
   const segments = []
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const s = sorted[i]
-    const e = sorted[i + 1]
-    if (e <= s) continue
+  let active = [] // 活动标注下标，始终升序
+  let cursor = 0
+  let k = 0
+
+  const emit = (end) => {
+    if (end <= cursor) return
     segments.push({
-      start: s,
-      end: e,
-      text: idx.slice(s, e),
-      codings: codings.filter((c) => c.start <= s && c.end >= e),
+      start: cursor,
+      end,
+      text: idx.slice(cursor, end),
+      codings: active.map((i) => codings[i]),
     })
   }
+
+  while (k < events.length) {
+    const p = events[k][0]
+    emit(p)
+    // 同位置事件一次处理完：先全部结束，再全部开始
+    const ending = new Set()
+    while (k < events.length && events[k][0] === p && events[k][1] === 0) {
+      ending.add(events[k][2])
+      k++
+    }
+    const starting = []
+    while (k < events.length && events[k][0] === p && events[k][1] === 1) {
+      starting.push(events[k][2])
+      k++
+    }
+    if (ending.size > 0 || starting.length > 0) {
+      // active 与 starting 各自升序，归并并剔除 ending；归并总量与输出规模同阶
+      const next = []
+      let ai = 0
+      let si = 0
+      while (ai < active.length || si < starting.length) {
+        const a = ai < active.length ? active[ai] : Infinity
+        const s = si < starting.length ? starting[si] : Infinity
+        if (a < s) {
+          if (!ending.has(a)) next.push(a)
+          ai++
+        } else {
+          next.push(s)
+          si++
+        }
+      }
+      active = next
+    }
+    cursor = p
+  }
+  emit(n)
   return segments
 }
 
