@@ -5,29 +5,69 @@ import { createTextIndex } from '../textIndex'
  * 把文本按所有编码边界切成原子段，每段携带覆盖它的编码列表。
  * 区间一律为 Unicode 码位坐标（与 API / 数据库一致）；切原文时经索引
  * 转成 UTF-16 偏移，绝不会把补充平面字符（如 emoji）的代理对切开。
+ *
+ * 扫线（sweep line）实现：为每条标注生成「开始 / 结束」两个事件，按码位
+ * 坐标排序后顺序扫描、维护当前活动标注集合，避免在每个边界都重新扫描全部
+ * 标注（旧实现为 O(边界数 × 标注数)，单篇数千条重叠标注时打开 / 编辑文档
+ * 明显卡顿）。语义与旧实现严格一致：
+ *  - 片段半开 [start, end)；同一坐标先处理结束事件、再处理开始事件，因此
+ *    首尾相接的 [a,b) 与 [b,c) 在 b 点不算同时覆盖，重叠（共占某一码位）
+ *    才算；
+ *  - 活动集合始终保持标注在入参数组中的先后次序，与旧版逐段 filter 的
+ *    结果相同，多重叠加渐变条带的颜色顺序不变；
+ *  - 起止位置先夹取到 [0, 全文码位数]，零长标注跳过，扫线产生的零长片段
+ *    不输出（空片段不渲染）。
  */
 export function buildSegments(content, codings) {
   const idx = createTextIndex(content)
-  const points = new Set([0, idx.length])
-  for (const c of codings) {
-    points.add(Math.max(0, c.start))
-    points.add(Math.min(idx.length, c.end))
+  const events = []
+  for (let i = 0; i < codings.length; i++) {
+    const c = codings[i]
+    const start = Math.max(0, c.start)
+    const end = Math.min(idx.length, c.end)
+    if (end <= start) continue
+    // type 0 = 结束、1 = 开始：同点先结束再开始（半开区间，相接不算重叠）
+    events.push({ pos: start, type: 1, index: i })
+    events.push({ pos: end, type: 0, index: i })
   }
-  const sorted = [...points].sort((a, b) => a - b)
+  events.sort((a, b) => a.pos - b.pos || a.type - b.type || a.index - b.index)
+
+  // 活动标注下标，始终按 codings 入参次序升序，二分维持有序
+  const active = []
+  const lowerBound = (target) => {
+    let lo = 0
+    let hi = active.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (active[mid] < target) lo = mid + 1
+      else hi = mid
+    }
+    return lo
+  }
+
   const segments = []
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const s = sorted[i]
-    const e = sorted[i + 1]
-    if (e <= s) continue
+  let cursor = 0
+  const pushSegment = (end) => {
+    if (end <= cursor) return
     segments.push({
-      start: s,
-      end: e,
-      text: idx.slice(s, e),
-      codings: codings.filter((c) => c.start <= s && c.end >= e),
+      start: cursor,
+      end,
+      text: idx.slice(cursor, end),
+      codings: active.length === 0 ? NO_CODINGS : active.map((i) => codings[i]),
     })
   }
+
+  for (const ev of events) {
+    pushSegment(ev.pos)
+    if (ev.type === 1) active.splice(lowerBound(ev.index), 0, ev.index)
+    else active.splice(lowerBound(ev.index), 1)
+    cursor = ev.pos
+  }
+  pushSegment(idx.length)
   return segments
 }
+
+const NO_CODINGS = Object.freeze([])
 
 function hexToRgba(hex, alpha) {
   const m = hex.replace('#', '')
